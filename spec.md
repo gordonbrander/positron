@@ -35,6 +35,8 @@ sequencer by calling methods on it.
 - Per-track scale/time multipliers (2×, 3/2×, …).
 - Song mode (arrangement rows with repeats/mutes). Pattern *chaining* is in scope;
   song arrangement is not.
+- Inter-step interpolation of parameter-lane values (modulation sequencing). Lanes
+  are event-scoped: values ride on fired trigs only.
 - Live recording modes.
 - `no_std` support (keep it in mind structurally, but don't commit to it).
 
@@ -48,7 +50,8 @@ them, but no code is written for them now.
 | Tracks | Exactly 16 per sequencer |
 | Steps | 16 steps per page, 1–8 pages per track → track length 1–128 steps |
 | Track length | Independent per track (polymeter); default 16 |
-| Parameter locks | Per-step override of track parameters (velocity, for now) |
+| Parameter lanes | 18 generic, unlabeled 0..1 values per track (defaults) and per fired event (resolved); the host decides what they mean (e.g. lanes 0–5 → FM operators, 6–9 → ADSR, 10–17 → macros) and scales 0..1 to real units |
+| Parameter locks | Per-step override of track parameters: velocity and any of the 18 lanes |
 | Probability trigs | Per-step chance 0–100% that an enabled trig fires |
 | Conditional trigs | Elektron-style conditions: `FILL`, `!FILL`, `PRE`, `!PRE`, `NEI`, `!NEI`, `1ST`, `!1ST`, `A:B` ratios |
 | Fill mode | Host-controlled flag (`set_fill`) read by the `FILL`/`!FILL` conditions; momentary/latched/one-shot press behavior is host policy |
@@ -105,11 +108,15 @@ The host turns offsets into sample-accurate scheduling (or ignores them):
 
 ```rust
 pub const PULSES_PER_STEP: u8 = 24;
+pub const NUM_PARAM_LANES: usize = 18;
 
 pub struct Event {
     pub track: u8,     // 0..16
     pub velocity: f32, // 0.0..=1.0
     pub offset: u8,    // pulses after window start, 0..24
+    /// Resolved parameter-lane values: per lane, the step's lock if set,
+    /// else the track default. See "Parameter lanes".
+    pub lanes: [f32; NUM_PARAM_LANES], // each 0.0..=1.0
 }
 
 /// Fixed-capacity event list (capacity 128 — provably sufficient, see
@@ -117,22 +124,28 @@ pub struct Event {
 pub struct TickOutput { /* push/iter over [Event; 128] + len */ }
 ```
 
-`tick()`:
+`tick()` — normative phase order, **evaluate then advance**:
 
-1. Advances every playing track's playhead by one step (each track wraps independently
-   at its own length — this is what produces polymeter).
-2. Evaluates the steps that schedule events into this window: the step under the
-   playhead, plus the next step when its negative micro-timing pulls it into this
-   window, plus any pending retrig-train hits.
-3. Returns the events, ordered by `(offset, track)`.
+1. If stopped, return an empty output; nothing advances.
+2. If `master_step` is on a change boundary, consume at most one queued pattern
+   change and perform the switch resets (see Timing semantics).
+3. Consume pending events that spilled into this window from the previous one.
+4. For each track in order 0→15, with its playhead as the window index `W`: examine
+   the steps that schedule events into this window (step `W`, plus step `W + 1` when
+   its negative micro-timing pulls it in) and emit retrig-train hits that fall
+   inside the window.
+5. Sort events by `(offset, track)` — stable, preserving push order (pending, step
+   `W`, step `W + 1`, train hits) for same-pulse ties.
+6. Advance every track's playhead by one step, wrapping at its own length
+   (polymeter) and incrementing its loop count on wrap; increment `master_step`.
 
-Convention: the first `tick()` after `play()` evaluates step 0; each subsequent tick
-evaluates the next step. (Equivalently: the playhead starts "before" step 0.)
+Convention: `play()` sets every playhead to 0, so the first `tick()` after `play()`
+evaluates step 0; each subsequent tick evaluates the next step.
 
-Staging note: through Slice 5 every event has `offset == 0` and at most one event per
-track exists per window, so early slices may implement the simpler
-`[Option<f32>; 16]` output; Slice 6 performs the migration to the event list before
-any timing feature lands.
+Staging note: `Event`, `TickOutput`, and the constants are defined in Slice 1 in
+their final shape; through Slice 6 every event has `offset == 0` and at most one
+event per track exists per window. Slice 6 adds the pulse helpers, pending-buffer
+plumbing, and ordering guarantees before any timing feature lands.
 
 ### Data model
 
@@ -165,10 +178,14 @@ pub struct Track {
     pub steps: [Step; MAX_STEPS],
 }
 
-/// Track-level parameters. Single field today; the lock mechanism is the
-/// extension point for future parameters (pitch, sample slot, ...).
+/// Track-level parameters. Velocity is distinguished — it gates output and
+/// drives the retrig velocity ramp. The lanes are generic, unlabeled 0..1
+/// values: the engine never knows what they control; the host owns the
+/// mapping (e.g. FM operator levels, ADSR times, macros) and any scaling
+/// from 0..1 to real units. "Adding a parameter" = picking a lane index.
 pub struct Params {
-    pub velocity: UnitValue, // default 1.0
+    pub velocity: UnitValue,                 // default 1.0
+    pub lanes: [UnitValue; NUM_PARAM_LANES], // defaults 0.0
 }
 
 pub struct Step {
@@ -186,6 +203,7 @@ pub struct Step {
 
 pub struct ParamLocks {
     pub velocity: Option<UnitValue>,
+    pub lanes: [Option<UnitValue>; NUM_PARAM_LANES],
 }
 
 pub struct Retrig {
@@ -275,8 +293,10 @@ which on a shared step grid is usually the same tick).
   `Nei` fails, `NotNei` passes. Does not update `last_cond`.
 - `First` / `NotFirst` — passes iff `loop_count == 0` / `> 0`. Updates `last_cond`.
 - `Ratio { a, b }` — passes iff `loop_count % b == a - 1`. Updates `last_cond`.
-  Constructor validates `1 <= a <= b <= 8` (invalid input clamps or returns `Err` —
-  decide in implementation, but unrepresentable invalid state is preferred).
+  The validated constructor `Condition::ratio(a, b)` enforces `1 <= a <= b <= 8`;
+  because the variant's fields stay public for ergonomic literals, evaluation is
+  defensive — `b` is clamped to `1..=8` and `a` to `1..=b` before use, so no input
+  can panic.
 
 Initial `last_cond` after `play()` is `false`.
 
@@ -284,10 +304,16 @@ Initial `last_cond` after `play()` is `false`.
 
 **Scheduling.** A trig on step `S` with micro-timing `m` and swing delay `w` is
 scheduled at pulse `(S * 24 + m + w) mod (track_length * 24)` on the track's cyclic
-pulse timeline. Events are emitted in whichever window contains their scheduled pulse:
-`m < 0` places the event near the end of window `S − 1` (wrapping to the end of the
-track's loop for step 0), and `m + w >= 24` spills into window `S + 1` via the
-per-track pending buffer.
+pulse timeline. Events are emitted in whichever window contains their scheduled
+pulse: `m < 0` places the event near the end of window `S − 1` (wrapping to the end
+of the track's loop for step 0). Whenever a computed in-window offset is ≥ 24 (e.g.
+`m + w >= 24`, or a pulled-in negative-micro step pushed back by swing,
+`24 + m + w >= 24`), the event routes through the per-track **pending buffer** into
+the next window at `offset − 24`. The maximum combined displacement is 37 pulses
+(`23 + 14`), so events spill **at most one window**; the pending buffer holds only
+such displaced one-shot step events — at most 2 per window (capacity 4, with a debug
+assertion). Retrig trains are never buffered ahead; they are generative runtime
+state emitting hits on demand.
 
 **Examination time.** Each step is *examined* (trig present? condition passes?
 probability drawn?) exactly once per track loop, in the window where its event lands
@@ -297,27 +323,35 @@ then step `W + 1` (if its `micro < 0`). Tracks are examined in order 0→15, so
 neighbor is delayed by `micro = +23` still reads that neighbor's already-evaluated
 result. A negative-micro trig on step 0 is examined in the *last* window of the
 track's loop; on the very first loop after `play()` that window hasn't occurred, so
-the trig is silent on pass one (matches hardware).
+the trig is silent on pass one (matches hardware; no special case is needed — the
+window simply never exists). When the examined index wraps this way, the event
+belongs to the *next* loop of the track, so loop-scoped conditions (`First`,
+`Ratio`) evaluate against `loop_count + 1`. Documented consequence: `First` on a
+negative-micro step 0 never fires — its only loop-0 instance is the silent one.
 
 Two events on the same track may land on the same pulse (e.g. step `S` at `+23` and
 step `S + 1` at `−1`); both are emitted and hosts treat them as simultaneous hits.
 
 **Swing.** `Pattern::swing` is a percent in `50..=80`; 50 = straight. Odd-indexed
 steps (1, 3, 5, … by index within the track) are delayed by
-`round(48 * swing / 100) − 24` pulses: 0 at 50%, 8 at 66% (triplet feel), 12 at 75%,
-14 at 80% — quantized to the pulse grid. Swing is per-pattern and applies to all
+`(48 * swing + 50) / 100 − 24` pulses (integer round-half-up): 0 at 50%, 8 at 66%
+(triplet feel), 12 at 75%, 14 at 80% — quantized to the pulse grid. Swing is per-pattern and applies to all
 tracks; under polymeter, parity is the step's index within its own track, by
 definition. Swing composes additively with micro-timing.
 
 **Retrigs.** When a trig with `retrig: Some(r)` fires, it starts a **train**: hits
 every `interval(r.rate)` pulses starting at the trig's scheduled pulse, lasting
-`r.length` pulses (`Infinite` = until replaced). Hit `k` of an `n`-hit train has
-velocity `clamp(v0 + r.vel_ramp * k / (n − 1), 0, 1)`, where `v0` is the trig's
-resolved velocity (p-lock or track default); `Infinite` trains ignore `vel_ramp`.
-The trig's condition gates the entire train (evaluated once, at examination). A track
-has at most one active train: any newly fired trig on the track — retrigging or not —
-replaces it. `stop()`, `reset()`, `play()`, and pattern changes clear trains and
-pending events.
+`r.length` pulses (`Infinite` = until replaced). The trig emits exactly **one**
+event at its scheduled pulse — that event *is* train hit `k = 0`; there is no
+double emission. Hit `k` of an `n`-hit train has velocity
+`clamp(v0 + r.vel_ramp * k / (n − 1), 0, 1)`, where `v0` is the trig's resolved
+velocity (p-lock or track default); a single-hit train (`n = 1`) plays at `v0`, and
+`Infinite` trains ignore `vel_ramp`. The trig's resolved lane values ride unchanged
+on every hit of the train. The trig's condition gates the entire train (evaluated
+once, at examination). A track has at most one active train: any newly fired trig
+on the track — retrigging or not — replaces it, truncating the old train's hits at
+pulses at or after the new trig's scheduled pulse. `stop()`, `reset()`, `play()`,
+and pattern changes clear trains and pending events.
 
 | Rate | Note value | Pulse interval |
 |---|---|---|
@@ -335,6 +369,16 @@ pending events.
 (Hardware also offers 1/80, which is not a whole number of pulses at 96 PPQN; the
 nearest representable rate is `R96`. Documented divergence.)
 
+**Parameter lanes.** Each fired event carries the track's `NUM_PARAM_LANES` lane
+values, resolved at examination time: per lane, the step's lock if set, else the
+track default. Lanes are **event-scoped** — values ride only on fired trigs, so a
+lane lock on a probability/conditional trig lands only when that trig actually
+fires, and non-fired steps emit nothing. The engine never interprets lane values;
+mapping lanes to synth parameters (and scaling 0..1 to Hz/seconds/ratios) is host
+territory, on the UI side of the shear line. Memory note: per-step lane locks cost
+a few hundred KB per pattern at 18 lanes — fine for desktop; a bitmask + packed
+representation is a possible future compression that would not change the API.
+
 **Output capacity.** The minimum retrig interval is 4 pulses → at most 6 train hits
 per track per window, plus at most 2 step events (one on-grid/positive-micro, one
 pulled-in negative-micro) → 8 events per track per window, 128 across 16 tracks.
@@ -347,16 +391,22 @@ counts steps since the current pattern started and `change_length` defaults to t
 pattern's master length (its longest track length). At each boundary, the queue head
 (if any) becomes the current pattern: playheads, loop counts, `last_cond`, retrig
 trains, pending events, and `master_step` all reset — so `1ST` fires again, as on
-hardware — while the PRNG state and the fill flag carry over. An empty queue means
-the current pattern keeps looping. Chaining = queueing several ids; the last pattern
+hardware — while the PRNG state and the fill flag carry over (not-yet-emitted
+pending events are dropped by the switch; already-emitted events stand). Because
+`master_step == 0` is a boundary and `play()` does not clear the queue, a change
+queued while stopped applies on the very first tick after `play()`. At most one
+queue entry is consumed per boundary. An empty queue means the current pattern
+keeps looping. Chaining = queueing several ids; the last pattern
 in a chain loops. To loop a whole chain, the host re-queues it (deliberate
 simplification; a `loop_chain` flag is a possible future addition).
 
 ### Transport semantics
 
 - `play()` — resets all playheads to step 0 (pending first tick), zeroes loop counts
-  and `master_step`, clears `last_cond`, retrig trains, and pending events. Does
-  **not** reseed the PRNG and does not clear the pattern-change queue.
+  and `master_step`, clears `last_cond`, retrig trains, and pending events. Calling
+  it while already playing restarts from step 0. Does **not** reseed the PRNG and
+  does not clear the pattern-change queue. (Note: `last_cond = false` means `!PRE`
+  initially passes.)
 - `stop()` — halts; `tick()` while stopped returns an empty output and advances
   nothing. Clears retrig trains and pending events.
 - `reset()` — like the position-reset part of `play()` but keeps current transport
@@ -397,7 +447,7 @@ seq.queue_pattern(b);                                    // switches at next bou
 // Page helpers for UI hosts (pure conveniences over `length`/`steps`)
 let t = &seq.current_pattern().tracks[0];
 assert_eq!(t.page_count(), 4);
-let page2: &[Step] = t.page(1);
+let page2: &[Step] = t.page(1).unwrap(); // Option: out-of-range never panics
 
 // Playback
 seq.play();
@@ -413,7 +463,8 @@ for ev in out.iter() {
 - Invalid values are prevented at construction wherever cheap: `UnitValue` clamps,
   `Track::set_length` rejects 0 and >128, `Condition::ratio(a, b)` validates bounds,
   `Step::set_micro` clamps to −23..=23, `Pattern::set_swing` clamps to 50..=80,
-  `Retrig::set_vel_ramp` clamps to −1..=1, `queue_pattern` rejects out-of-range ids.
+  `Retrig::set_vel_ramp` clamps to −1..=1, `queue_pattern` rejects out-of-range ids,
+  `page`/`page_mut` return `Option` rather than panicking.
 - No method panics on any sequence of public API calls (enforced by a fuzz/property
   test in the final slice).
 
@@ -434,20 +485,26 @@ getting velocity output (track defaults only).*
       `cargo fmt`/`clippy` config
 - [ ] `UnitValue` newtype: clamping constructor, `get() -> f32`, `Default` (define
       default as 1.0 for velocity use), `PartialEq`, `Clone`, `Copy`, `Debug`
-- [ ] Constants: `NUM_TRACKS`, `STEPS_PER_PAGE`, `MAX_PAGES`, `MAX_STEPS`
+- [ ] Constants: `NUM_TRACKS`, `STEPS_PER_PAGE`, `MAX_PAGES`, `MAX_STEPS`,
+      `PULSES_PER_STEP`, `NUM_PARAM_LANES`
 - [ ] `Step` with just `trig: bool` for now (locks/conditions arrive in later slices);
-      `Params { velocity }`; `Track { length (fixed 16 for this slice), defaults,
-      steps: [Step; MAX_STEPS] }`; `Pattern { tracks }` — all `Clone + PartialEq +
-      Debug + Default`
-- [ ] `TickOutput { velocities: [Option<f32>; NUM_TRACKS] }`
-- [ ] `Sequencer { pattern, transport, track_state }` with `new()`, `play()`, `stop()`,
-      `reset()`, `is_playing()`
-- [ ] `tick()`: while playing, evaluate step under each playhead (fires iff
-      `step.trig`), emit `Some(track.defaults.velocity)`, advance and wrap playheads
-      at length 16; while stopped, return all-`None` and don't advance
-- [ ] Tests: programmed steps fire on the right ticks; wrap after 16 ticks;
-      tick-while-stopped is a no-op; `play()` restarts from step 0; velocity output
-      equals track default; editing `trig` while playing takes effect on next pass
+      `Params { velocity, lanes }`; `Track { length (fixed 16 for this slice),
+      defaults, steps: [Step; MAX_STEPS] }`; `Pattern { tracks }` — all `Clone +
+      PartialEq + Debug + Default`
+- [ ] `Event` and `TickOutput` in their final shape (fixed-capacity event buffer;
+      offsets all 0 until Slice 7; lanes resolved from track defaults until Slice 3)
+- [ ] `Sequencer` with private pattern storage exposed only via `current_pattern()` /
+      `current_pattern_mut()` (so Slice 10's multi-pattern storage swap is
+      non-breaking); `new()`, `play()`, `stop()`, `reset()`, `is_playing()`
+- [ ] `tick()`: evaluate-then-advance — examine the step at each playhead (fires iff
+      `step.trig`), emit events with the track's default velocity and lanes, then
+      advance and wrap playheads at length 16; while stopped, return empty and don't
+      advance
+- [ ] Tests (via a `fired()` helper in `tests/common/mod.rs` that projects
+      `TickOutput` to `[Option<f32>; NUM_TRACKS]`): programmed steps fire on the
+      right ticks; wrap after 16 ticks; tick-while-stopped is a no-op; `play()`
+      restarts from step 0; velocity output equals track default; editing `trig`
+      while playing takes effect on next pass
 - [ ] Doc comments on all public items; crate-level doc with a runnable example
 
 ### Slice 2 — Pages and per-track length (polymeter)
@@ -460,10 +517,12 @@ page-oriented read/write helpers.*
 - [ ] Playhead wrapping uses per-track length; increment per-track `loop_count` on wrap
       (needed by Slice 5, cheap to add now)
 - [ ] Behavior decision (document it): when length is shortened below the current
-      playhead position, the playhead wraps into range on the next tick rather than
-      panicking
-- [ ] Page helpers: `page_count()`, `page(i) -> &[Step]`, `page_mut(i) -> &mut [Step]`,
-      `set_page_count(n)` (sets length to `n * 16`)
+      playhead position, the playhead wraps into range (`playhead % length`) on the
+      next tick rather than panicking, **without** incrementing `loop_count` (an
+      edit artifact is not a completed loop)
+- [ ] Page helpers: `page_count()`, `page(i) -> Option<&[Step]>`,
+      `page_mut(i) -> Option<&mut [Step]>`, `set_page_count(n) -> Result` (sets
+      length to `n * 16`)
 - [ ] Tests: two tracks with lengths 16 and 12 drift against each other and realign at
       step 48 (polymeter); length-1 track fires every tick; shortening length while
       playing rewraps safely; page helpers index correctly; out-of-range page/length
@@ -473,24 +532,30 @@ page-oriented read/write helpers.*
 
 ### Slice 3 — Parameter locks
 
-*Outcome: per-step velocity overrides, the Elektron p-lock mechanic.*
+*Outcome: per-step overrides of velocity and all 18 parameter lanes — the Elektron
+p-lock mechanic.*
 
-- [ ] `ParamLocks { velocity: Option<UnitValue> }` on `Step`, `Default` = no locks
-- [ ] Resolution in `tick()`: fired velocity = `step.locks.velocity` if set, else
-      `track.defaults.velocity`
+- [ ] `ParamLocks { velocity: Option<UnitValue>, lanes: [Option<UnitValue>; 18] }`
+      on `Step`, `Default` = no locks
+- [ ] Resolution helper `resolve(step, &track.defaults) -> (velocity, lanes)`:
+      per field, lock if set, else track default (reused by Slice 9 for train base
+      values)
 - [ ] Convenience: `Step::clear_locks()`; `Track::clear_all_locks()`
-- [ ] Tests: locked step emits lock value, unlocked steps emit default; changing the
-      track default doesn't affect locked steps; clearing a lock reverts to default;
-      lock survives `play()`/`stop()` (it's pattern data, not runtime state)
-- [ ] Doc note for future maintainers: adding a new parameter = one field in `Params`,
-      one in `ParamLocks`, one line in resolution
+- [ ] Tests: locked step emits lock value, unlocked steps emit default — for
+      velocity and for individual lanes; changing the track default doesn't affect
+      locked steps; clearing a lock reverts to default; lane locks ride only fired
+      trigs (a lock on a non-trig step emits nothing); lock survives
+      `play()`/`stop()` (it's pattern data, not runtime state)
+- [ ] Doc note for future maintainers: adding a parameter = picking a lane index;
+      the engine never changes
 
 ### Slice 4 — Probability trigs
 
 *Outcome: per-step fire probability with deterministic, seedable randomness.*
 
-- [ ] Introduce `Condition` enum with only `Always` and `Percent(UnitValue)` variants;
-      add `condition: Condition` to `Step` (`Default` = `Always`)
+- [ ] Introduce `Condition` enum with only `Always` and `Percent(UnitValue)` variants,
+      `#[non_exhaustive]` from day one; add `condition: Condition` to `Step`
+      (`Default` = `Always`)
 - [ ] Embed a small deterministic PRNG (PCG32 or xoshiro — implement in-crate or via a
       `rand_core` dependency; keep it swappable behind a private type alias)
 - [ ] `Sequencer::new(seed: u64)` and `Sequencer::seed(u64)`
@@ -522,29 +587,32 @@ page-oriented read/write helpers.*
   - [ ] `Pre` mirrors a preceding `Percent` step's outcome on the same track (seeded
         so both outcomes occur); `NotPre` is the complement; `Always` steps in between
         don't disturb it
-  - [ ] `Nei` mirrors the neighbor track; `Nei` on track 0 never fires; chained
-        neighbors (track 2 watching 1 watching 0) resolve in one tick
+  - [ ] `Nei` mirrors the neighbor track's most recent *state-writing* conditional;
+        `Nei` on track 0 never fires; NEI is transparent — a `Nei` step does not
+        write `last_cond`, so track 2 watching track 1 (whose step is itself `Nei`)
+        reads track 1's last state-writing conditional, not its `Nei` outcome
   - [ ] `First` fires only during loop 0 of its own track — verify against a
         polymeter neighbor to prove per-track loop counting
   - [ ] `Ratio{1,2}`/`Ratio{2,2}` alternate loops; `Ratio{8,8}` fires once per 8 loops;
         invalid ratios rejected
   - [ ] `play()` resets loop counts and `last_cond` (a `First` trig fires again)
 
-### Slice 6 — Pulse timeline and timed-event output
+### Slice 6 — Pulse timeline and pending plumbing
 
-*Outcome: `tick()` returns timed events with pulse offsets — the foundation for
-micro-timing, swing, and retrigs. Behavior is unchanged after this slice (every
-offset is still 0); only the output shape evolves.*
+*Outcome: the sub-step machinery micro-timing, swing, and retrigs will build on.
+Behavior is unchanged after this slice (every offset is still 0); `Event` and
+`TickOutput` already exist in final shape from Slice 1.*
 
-- [ ] `PULSES_PER_STEP = 24` constant; pulse-position helpers on `Track`
-      (step → pulse, cyclic pulse length = `length * 24`)
-- [ ] `Event { track, velocity, offset }`; replace `[Option<f32>; 16]` output with
-      `TickOutput`, a fixed-capacity (128) event buffer with push/iter; document the
-      capacity proof from the Timing semantics section
-- [ ] Per-track `PendingEvents` buffer plumbing (stays empty until later slices);
-      cleared on `play()`/`stop()`/`reset()`
-- [ ] Events ordered by `(offset, track)` within a window
-- [ ] Migrate Slice 1–5 tests to the new output shape; assert all offsets are 0
+- [ ] Pulse-position helpers on `Track` (step → pulse, cyclic pulse length =
+      `length * 24`)
+- [ ] Per-track `PendingEvents` buffer (capacity 4, debug-asserted; stays empty
+      until later slices); consumed at the start of each window; cleared on
+      `play()`/`stop()`/`reset()`
+- [ ] Stable insertion sort of `TickOutput` by `(offset, track)`, preserving push
+      order for ties; document the capacity proof from the Timing semantics section
+      and debug-assert on push
+- [ ] Tests: ordering guarantee; all offsets still 0; a fixed multi-track pattern
+      produces output identical to its Slice 5 behavior (behavior-unchanged check)
 
 ### Slice 7 — Micro-timing
 
@@ -584,17 +652,22 @@ offset is still 0); only the output shape evolves.*
       `Step.retrig: Option<Retrig>`; validated constructors
 - [ ] `ActiveTrain` per-track runtime state: starts when a retrig trig fires; hits
       emitted across subsequent windows via the pending machinery
-- [ ] Replacement rule: any newly fired trig on the track replaces the active train;
+- [ ] Replacement rule: any newly fired trig on the track replaces the active train,
+      truncating the old train's hits at pulses ≥ the new trig's scheduled pulse;
       `stop()`/`reset()`/`play()`/pattern-change clears it
+- [ ] The fired trig's event *is* hit `k = 0` — exactly one event at the scheduled
+      pulse, no double emission
 - [ ] Velocity ramp: linear from resolved trig velocity, hit `k` of `n` =
-      `clamp(v0 + ramp * k/(n−1))`; `Infinite` ignores ramp
-- [ ] Condition gates the whole train (one evaluation); velocity p-lock sets the
-      train's base velocity
+      `clamp(v0 + ramp * k/(n−1))`; `n = 1` plays at `v0`; `Infinite` ignores ramp
+- [ ] Condition gates the whole train (one evaluation); velocity/lane p-locks set
+      the train's base values; lane values ride unchanged on every hit
 - [ ] Tests: hit spacing matches the table for every rate; a train spans window
-      boundaries; finite train hit count = `length / interval + 1`; `Infinite` runs
-      until the next fired trig; mid-train replacement; ramp endpoints and clamping;
-      worst case (16 tracks × `R96`) stays within `TickOutput` capacity; probability-
-      gated retrig is deterministic under a fixed seed
+      boundaries; finite train hit count = `length / interval + 1`; single-hit train
+      (`length < interval`) plays at `v0`; `Infinite` runs until the next fired
+      trig; mid-train replacement truncates at the new trig's pulse; ramp endpoints
+      and clamping; lanes identical across hits; worst case (16 tracks × `R96`)
+      stays within `TickOutput` capacity; probability-gated retrig is deterministic
+      under a fixed seed
 
 ### Slice 10 — Pattern chaining
 
@@ -626,16 +699,20 @@ reference host demonstrating the shear line.*
 - [ ] `serde` feature flag: `Serialize`/`Deserialize` for `Pattern` and everything in
       it, including `Retrig`, swing, and `change_length` (not `Sequencer` runtime
       state); round-trip test; feature-gated in CI
-- [ ] Property/fuzz test: arbitrary sequence of public API calls (edits, transport,
-      ticks, seeds) never panics and never emits a velocity outside `0.0..=1.0`
+- [ ] Property/fuzz test: arbitrary sequence of public API calls (edits including
+      raw `Ratio { a, b }` literals and out-of-range page indices, transport, ticks,
+      seeds, queueing) never panics and never emits a velocity or lane value outside
+      `0.0..=1.0`
 - [ ] Golden-file test: a richly-featured project (all condition types, locks,
       polymeter, micro-timing, swing, retrigs, and a two-pattern chain) ticked 512
       times with a fixed seed, output snapshot committed — guards against accidental
       semantic changes
 - [ ] `examples/cli_host.rs`: minimal host that programs a demo pattern, runs a
-      tokio-free loop with `std::thread::sleep` as its "clock", and prints fired
-      steps — proves the headless API is sufficient and ergonomic
+      tokio-free loop with `std::thread::sleep` as its "clock", prints fired steps,
+      and demonstrates a lane → synth-parameter mapping table (lanes 0–5 "FM ops",
+      6–9 "ADSR", 10–17 "macros") — proves the headless API is sufficient and the
+      shear line holds
 - [ ] README with the architecture diagram, semantics table, and quickstart
-- [ ] Final API review: every public item documented, `#[non_exhaustive]` on
-      `Condition` (future condition types), audit `pub` fields vs. accessors against
+- [ ] Final API review: every public item documented, `#[non_exhaustive]` present on
+      `Condition` (introduced in Slice 4), audit `pub` fields vs. accessors against
       the invariants
