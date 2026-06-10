@@ -1,4 +1,4 @@
-# elektronlike
+# positron
 
 A headless Elektron-style step sequencer in Rust: pure state and behavior —
 no UI, no audio, no MIDI, no clock, no threads, no I/O.
