@@ -1,0 +1,44 @@
+[package]
+name = "elektronlike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Headless Elektron-style step sequencer: pure state and behavior, no UI"
+license = "MIT OR Apache-2.0"
+
+# Basic optimization in dev so large fixed-size pattern values (~320 KB) get
+# their copies elided during construction; unoptimized builds can otherwise
+# overflow 2 MiB test-thread stacks. Debug assertions remain enabled.
+[profile.dev]
+opt-level = 1
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Serialize/Deserialize for Pattern and everything inside it (never the
+# Sequencer's runtime state). Deserialization re-validates every invariant.
+# Note: deserializing a full Pattern holds a few ~320 KB stack temporaries;
+# do it on a thread with headroom (the main thread is fine).
+serde = ["dep:serde"]
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Casts below are invariant-protected (track indices < 16, step indices < 128).
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+# The engine is deterministic and passes f32 values through unchanged;
+# tests intentionally assert exact equality.
+float_cmp = "allow"
+# Fixed-size pattern storage is a design goal (no allocation in tick());
+# a Track with per-step lane locks is ~20 KB, documented in spec.md.
+large_stack_arrays = "allow"
