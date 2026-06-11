@@ -167,22 +167,24 @@ arrive sorted by offset, so a single advancing cursor suffices:
 ```rust
 let pulse_duration = step_duration / u32::from(PULSES_PER_STEP);
 let start = Instant::now();
-let mut window = TickOutput::default_empty(); // or Option<TickOutput>
+// TickOutput has no public constructor (only tick() makes one), so the
+// not-yet-ticked state is an Option.
+let mut window: Option<TickOutput> = None;
 let mut cursor = 0;
 
-for pulse in 0u64.. {
+for pulse in 0u32.. {
     let in_window = (pulse % 24) as u8;
     if in_window == 0 {
-        window = seq.tick();
+        window = Some(seq.tick());
         cursor = 0;
     }
-    let events = window.as_slice();
+    let events = window.as_ref().map_or(&[][..], TickOutput::as_slice);
     while cursor < events.len() && events[cursor].offset == in_window {
         fire(&events[cursor]); // immediately — no scheduling
         cursor += 1;
     }
     // Absolute deadline so error never accumulates:
-    sleep_until(start + (pulse + 1) as u32 * pulse_duration);
+    sleep_until(start + pulse_duration * (pulse + 1));
 }
 ```
 
