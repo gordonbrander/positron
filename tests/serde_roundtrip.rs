@@ -1,7 +1,7 @@
 //! Slice 11: serde round-trips and deserialization validation.
 #![cfg(feature = "serde")]
 
-use elektronlike::{Condition, Pattern, Retrig, RetrigLength, RetrigRate, Track, UnitValue};
+use plock::{Condition, Pattern, Retrig, RetrigLength, RetrigRate, Track, UnitValue};
 use std::num::NonZeroU16;
 
 fn rich_pattern() -> Pattern {

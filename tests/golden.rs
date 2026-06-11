@@ -5,7 +5,7 @@
 
 mod common;
 
-use elektronlike::{Condition, Pattern, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue};
+use plock::{Condition, Pattern, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue};
 use std::fmt::Write as _;
 use std::num::NonZeroU16;
 

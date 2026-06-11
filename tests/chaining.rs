@@ -3,7 +3,7 @@
 mod common;
 
 use common::fired;
-use elektronlike::{Condition, Pattern, PatternId, Sequencer};
+use plock::{Condition, Pattern, PatternId, Sequencer};
 use std::num::NonZeroU16;
 
 /// Pattern with a single trig on `track` 0 at `step`.
@@ -173,7 +173,7 @@ fn out_of_range_ids_rejected_at_queue_time() {
 
 #[test]
 fn switch_drops_in_flight_sub_step_events() {
-    use elektronlike::{Retrig, RetrigLength, RetrigRate};
+    use plock::{Retrig, RetrigLength, RetrigRate};
 
     let mut seq = Sequencer::new(1);
     {

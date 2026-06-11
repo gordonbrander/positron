@@ -3,7 +3,7 @@
 mod common;
 
 use common::fired;
-use elektronlike::{Condition, Sequencer, UnitValue};
+use plock::{Condition, Sequencer, UnitValue};
 
 #[test]
 fn percent_one_always_fires() {

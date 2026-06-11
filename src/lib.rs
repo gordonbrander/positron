@@ -6,7 +6,7 @@
 //! and scheduling the returned [`Event`]s. See `spec.md` for the full design.
 //!
 //! ```
-//! use elektronlike::Sequencer;
+//! use plock::Sequencer;
 //!
 //! let mut seq = Sequencer::new(0xDEAD_BEEF);
 //! let track = &mut seq.current_pattern_mut().tracks[0];

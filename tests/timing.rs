@@ -2,7 +2,7 @@
 
 mod common;
 
-use elektronlike::{PULSES_PER_STEP, Sequencer};
+use plock::{PULSES_PER_STEP, Sequencer};
 
 #[test]
 fn pulse_helpers() {
@@ -118,7 +118,7 @@ fn same_pulse_collision_emits_both_events() {
 
 #[test]
 fn pre_follows_grid_order_not_audible_order() {
-    use elektronlike::{Condition, UnitValue};
+    use plock::{Condition, UnitValue};
 
     let mut seq = Sequencer::new(1);
     let track = &mut seq.current_pattern_mut().tracks[0];
@@ -138,7 +138,7 @@ fn pre_follows_grid_order_not_audible_order() {
 
 #[test]
 fn first_on_negative_micro_step_zero_never_fires() {
-    use elektronlike::Condition;
+    use plock::Condition;
 
     let mut seq = Sequencer::new(1);
     let track = &mut seq.current_pattern_mut().tracks[0];
@@ -155,7 +155,7 @@ fn first_on_negative_micro_step_zero_never_fires() {
 
 #[test]
 fn ratio_on_negative_micro_step_zero_stays_loop_aligned() {
-    use elektronlike::Condition;
+    use plock::Condition;
 
     let mut seq = Sequencer::new(1);
     let track = &mut seq.current_pattern_mut().tracks[0];
@@ -178,7 +178,7 @@ fn ratio_on_negative_micro_step_zero_stays_loop_aligned() {
 
 #[test]
 fn micro_displacement_does_not_shift_other_tracks_randomness() {
-    use elektronlike::{Condition, UnitValue};
+    use plock::{Condition, UnitValue};
 
     let run = |with_micro: i8| -> Vec<bool> {
         let mut seq = Sequencer::new(0x00C0_FFEE);
@@ -200,7 +200,7 @@ fn micro_displacement_does_not_shift_other_tracks_randomness() {
 
 #[test]
 fn swing_50_is_a_no_op() {
-    let run = |set: Option<u8>| -> Vec<elektronlike::TickOutput> {
+    let run = |set: Option<u8>| -> Vec<plock::TickOutput> {
         let mut seq = Sequencer::new(5);
         let pattern = seq.current_pattern_mut();
         for s in 0..8 {
@@ -321,7 +321,7 @@ fn swing_parity_is_per_track_index_under_polymeter() {
 fn behavior_unchanged_by_pulse_plumbing() {
     // A fixed multi-feature pattern (conditions, locks, polymeter) keeps its
     // step-level behavior: this guards the slice 6 refactor.
-    use elektronlike::{Condition, UnitValue};
+    use plock::{Condition, UnitValue};
 
     let mut seq = Sequencer::new(99);
     {

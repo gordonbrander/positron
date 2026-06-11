@@ -2,7 +2,7 @@
 
 mod common;
 
-use elektronlike::{Condition, Retrig, RetrigLength, RetrigRate, Sequencer, TickOutput, UnitValue};
+use plock::{Condition, Retrig, RetrigLength, RetrigRate, Sequencer, TickOutput, UnitValue};
 
 fn offsets(out: &TickOutput, track: u8) -> Vec<u8> {
     out.iter()

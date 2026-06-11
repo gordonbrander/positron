@@ -3,7 +3,7 @@
 
 mod common;
 
-use elektronlike::{
+use plock::{
     Condition, Pattern, PatternId, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue,
 };
 use proptest::prelude::*;
@@ -177,7 +177,7 @@ proptest! {
                             prop_assert!((0.0..=1.0).contains(&ev.velocity));
                             prop_assert!(ev.lanes.iter().all(|l| (0.0..=1.0).contains(l)));
                             prop_assert!(ev.offset < 24);
-                            prop_assert!(usize::from(ev.track) < elektronlike::NUM_TRACKS);
+                            prop_assert!(usize::from(ev.track) < plock::NUM_TRACKS);
                         }
                     }
                 }
@@ -200,7 +200,7 @@ proptest! {
                 Op::SetLaneLock { track, step, lane, v } => {
                     let t = &mut seq.current_pattern_mut().tracks[usize::from(track) % 16];
                     t.steps[usize::from(step) % 128].locks.lanes
-                        [usize::from(lane) % elektronlike::NUM_PARAM_LANES] =
+                        [usize::from(lane) % plock::NUM_PARAM_LANES] =
                         Some(UnitValue::new(v));
                 }
                 Op::SetCondition { track, step, pick, a, b, p } => {

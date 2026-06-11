@@ -3,7 +3,7 @@
 mod common;
 
 use common::{fire_ticks, fired};
-use elektronlike::{Sequencer, UnitValue};
+use plock::{Sequencer, UnitValue};
 
 #[test]
 fn programmed_steps_fire_on_the_right_ticks() {

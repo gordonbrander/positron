@@ -3,7 +3,7 @@
 mod common;
 
 use common::{fire_ticks, fired};
-use elektronlike::{MAX_STEPS, Sequencer, UnitValue};
+use plock::{MAX_STEPS, Sequencer, UnitValue};
 use proptest::prelude::*;
 
 #[test]

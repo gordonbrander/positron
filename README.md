@@ -1,14 +1,13 @@
-# elektronlike
+# plock
 
-A headless Elektron-style step sequencer in Rust: pure state and behavior —
-no UI, no audio, no MIDI, no clock, no threads, no I/O.
+A headless Elektron-like step sequencer in Rust.
 
 The host owns time and presentation; the sequencer is a deterministic state
 machine you drive one step at a time. [`spec.md`](spec.md) is the full design
 document with normative semantics; this README is the developer tour.
 
 ```rust
-use elektronlike::{Condition, Sequencer, UnitValue};
+use plock::{Condition, Sequencer, UnitValue};
 
 let mut seq = Sequencer::new(0xDEAD_BEEF); // seed for probability trigs
 
@@ -283,7 +282,7 @@ Practical guidance:
 ## serde support
 
 ```toml
-elektronlike = { version = "0.1", features = ["serde"] }
+plock = { version = "0.1", features = ["serde"] }
 ```
 
 `Pattern` and everything inside it implement `Serialize`/`Deserialize`;

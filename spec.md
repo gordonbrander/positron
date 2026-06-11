@@ -1,8 +1,8 @@
-# elektronlike — a headless Elektron-style step sequencer in Rust
+# plock — a headless Elektron-style step sequencer in Rust
 
 ## Overview
 
-`elektronlike` is a Rust library crate implementing the data model and behavior of an
+`plock` is a Rust library crate implementing the data model and behavior of an
 Elektron-style step sequencer (Digitakt/Octatrack lineage): tracks of trigs with
 parameter locks, probability, trig conditions, micro-timing, retrigs, swing, and
 quantized pattern chaining. It is **headless**: pure state and

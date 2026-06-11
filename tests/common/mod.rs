@@ -1,7 +1,7 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
-use elektronlike::{NUM_TRACKS, Sequencer, TickOutput};
+use plock::{NUM_TRACKS, Sequencer, TickOutput};
 
 /// Projects a tick's events onto per-track velocities — the "did each track
 /// fire, and how hard" view that most tests assert against.

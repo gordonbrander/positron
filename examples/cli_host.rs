@@ -4,14 +4,14 @@
 //!
 //! Run: `cargo run --example cli_host`
 
-use elektronlike::{
+use plock::{
     Condition, PULSES_PER_STEP, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue,
 };
 use std::time::Duration;
 
 /// The host's side of the shear line: the engine has 18 unlabeled lanes;
 /// this table decides what they mean.
-const LANE_NAMES: [&str; elektronlike::NUM_PARAM_LANES] = [
+const LANE_NAMES: [&str; plock::NUM_PARAM_LANES] = [
     "fm.op1", "fm.op2", "fm.op3", "fm.op4", "fm.op5", "fm.op6", // 0-5: FM operators
     "env.a", "env.d", "env.s", "env.r", // 6-9: ADSR
     "macro1", "macro2", "macro3", "macro4", "macro5", "macro6", "macro7",

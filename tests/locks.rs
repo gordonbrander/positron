@@ -3,7 +3,7 @@
 mod common;
 
 use common::fired;
-use elektronlike::{Sequencer, UnitValue};
+use plock::{Sequencer, UnitValue};
 
 #[test]
 fn locked_step_emits_lock_value_unlocked_emit_default() {

@@ -1,9 +1,9 @@
 [package]
-name = "elektronlike"
+name = "plock"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Headless Elektron-style step sequencer: pure state and behavior, no UI"
+description = "Headless Elektron-like step sequencer"
 license = "MIT OR Apache-2.0"
 
 # Basic optimization in dev so large fixed-size pattern values (~320 KB) get

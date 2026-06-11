@@ -2,7 +2,7 @@
 
 mod common;
 
-use elektronlike::{Condition, Pattern, Sequencer, TickOutput, UnitValue};
+use plock::{Condition, Pattern, Sequencer, TickOutput, UnitValue};
 
 /// A pattern with probability trigs on several tracks.
 fn probabilistic_pattern() -> Pattern {
