@@ -4,19 +4,26 @@
 //!
 //! Run: `cargo run --example cli_host`
 
-use plock::{
-    Condition, PULSES_PER_STEP, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue,
-};
+use plock::{Condition, PULSES_PER_STEP, Retrig, RetrigLength, RetrigRate, Sequencer, UnitValue};
 use std::time::Duration;
 
-/// The host's side of the shear line: the engine has 18 unlabeled lanes;
-/// this table decides what they mean.
-const LANE_NAMES: [&str; plock::NUM_PARAM_LANES] = [
+/// The host's side of the shear line: the engine has 64 unlabeled lanes;
+/// this table decides what the ones this host uses mean. Lanes the host
+/// hasn't assigned yet fall back to a generic name.
+const LANE_NAMES: [&str; 18] = [
     "fm.op1", "fm.op2", "fm.op3", "fm.op4", "fm.op5", "fm.op6", // 0-5: FM operators
     "env.a", "env.d", "env.s", "env.r", // 6-9: ADSR
     "macro1", "macro2", "macro3", "macro4", "macro5", "macro6", "macro7",
     "macro8", // 10-17: macros
 ];
+
+/// Name of lane `i`: the mapping table where the host has one, a generic
+/// label for the rest of the engine's 64 lanes.
+fn lane_name(i: usize) -> String {
+    LANE_NAMES
+        .get(i)
+        .map_or_else(|| format!("lane{i}"), ToString::to_string)
+}
 
 const BPM: f64 = 132.0;
 
@@ -32,7 +39,6 @@ fn main() {
         for s in [0, 4, 8, 12] {
             kick.steps[s].trig = true;
         }
-        kick.steps[12].locks.velocity = Some(UnitValue::new(0.6));
 
         let hat = &mut pattern.tracks[1];
         for s in 0..16 {
@@ -49,10 +55,16 @@ fn main() {
         let lead = &mut pattern.tracks[2];
         lead.set_length(12).unwrap(); // polymeter against the others
         lead.steps[0].trig = true;
-        lead.steps[0].locks.lanes[0] = Some(UnitValue::new(0.8)); // fm.op1 jump
         lead.steps[6].trig = true;
         lead.steps[6].condition = Condition::ratio(2, 2).unwrap();
         lead.steps[6].retrig = Some(Retrig::new(RetrigRate::R32, RetrigLength::pulses(24), -0.5));
+
+        // P-locks live in the pattern's lock pool (capped at
+        // plock::MAX_LOCK_LANES distinct destinations, like the hardware).
+        pattern
+            .set_velocity_lock(0, 12, UnitValue::new(0.6))
+            .unwrap();
+        pattern.set_lane_lock(2, 0, 0, UnitValue::new(0.8)).unwrap(); // fm.op1 jump
     }
 
     let step_duration = Duration::from_secs_f64(60.0 / BPM / 4.0);
@@ -65,12 +77,17 @@ fn main() {
         for ev in &out {
             // A real host would schedule each event `ev.offset` pulses into
             // this step window, sample-accurately. We just annotate it.
+            // Non-zero lanes, with a '*' marking values that came from a
+            // p-lock rather than the track default (Event::locked).
             let changed: Vec<String> = ev
                 .lanes
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| **v > 0.0)
-                .map(|(i, v)| format!("{}={v:.2}", LANE_NAMES[i]))
+                .map(|(i, v)| {
+                    let lock = if ev.locked >> i & 1 == 1 { "*" } else { "" };
+                    format!("{}={v:.2}{lock}", lane_name(i))
+                })
                 .collect();
             println!(
                 "step {tick:>3}  track {:>2}  vel {:.2}  +{:>2} pulses  {}",

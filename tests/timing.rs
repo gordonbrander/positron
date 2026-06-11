@@ -328,7 +328,9 @@ fn behavior_unchanged_by_pulse_plumbing() {
         let pattern = seq.current_pattern_mut();
         pattern.tracks[0].steps[0].trig = true;
         pattern.tracks[0].steps[8].trig = true;
-        pattern.tracks[0].steps[8].locks.velocity = Some(UnitValue::new(0.4));
+        pattern
+            .set_velocity_lock(0, 8, UnitValue::new(0.4))
+            .unwrap();
         pattern.tracks[1].set_length(12).unwrap();
         pattern.tracks[1].steps[0].trig = true;
         pattern.tracks[1].steps[0].condition = Condition::ratio(1, 2).unwrap();

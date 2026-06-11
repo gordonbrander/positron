@@ -14,7 +14,7 @@ use crate::NUM_PARAM_LANES;
 pub const MAX_EVENTS_PER_TICK: usize = 160;
 
 /// A fired trig, stamped with its pulse offset inside the tick's step window.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Event {
     /// Which track fired (`0..16`).
     pub track: u8,
@@ -27,6 +27,13 @@ pub struct Event {
     /// step's lock if set, else the track default. The engine attaches no
     /// meaning to these; mapping and scaling are host concerns.
     pub lanes: [f32; NUM_PARAM_LANES],
+    /// Bit `i` set ⇔ `lanes[i]` came from a lock rather than the track
+    /// default. Lanes only — velocity has
+    /// [`velocity_locked`](Self::velocity_locked). Snapshot-style hosts can
+    /// ignore this; delta-style hosts apply only the masked lanes.
+    pub locked: u64,
+    /// True iff `velocity` came from a velocity lock.
+    pub velocity_locked: bool,
 }
 
 impl Event {
@@ -35,7 +42,17 @@ impl Event {
         velocity: 0.0,
         offset: 0,
         lanes: [0.0; NUM_PARAM_LANES],
+        locked: 0,
+        velocity_locked: false,
     };
+}
+
+/// `[f32; 64]` has no std `Default`, so the derive is unavailable; the
+/// manual impl returns the all-zero event.
+impl Default for Event {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Fixed-capacity list of the events scheduled in one step window.

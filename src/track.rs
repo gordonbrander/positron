@@ -34,6 +34,7 @@ pub struct Params {
     /// Default velocity for trigs on this track. Defaults to `1.0`.
     pub velocity: UnitValue,
     /// Default values for the generic parameter lanes. Default to `0.0`.
+    #[cfg_attr(feature = "serde", serde(with = "lane_array"))]
     pub lanes: [UnitValue; NUM_PARAM_LANES],
 }
 
@@ -74,6 +75,36 @@ fn de_length<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D:
         )));
     }
     Ok(v)
+}
+
+/// serde lacks built-in support for arrays longer than 32, so the 64-lane
+/// defaults array round-trips as a plain sequence. Values re-clamp for free
+/// via `UnitValue`'s own `Deserialize`; a wrong element count is structural
+/// corruption and is rejected.
+#[cfg(feature = "serde")]
+mod lane_array {
+    use super::{NUM_PARAM_LANES, UnitValue};
+    use serde::ser::SerializeSeq;
+
+    pub fn serialize<S: serde::Serializer>(
+        lanes: &[UnitValue; NUM_PARAM_LANES],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(NUM_PARAM_LANES))?;
+        for lane in lanes {
+            seq.serialize_element(lane)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[UnitValue; NUM_PARAM_LANES], D::Error> {
+        let v = <Vec<UnitValue> as serde::Deserialize>::deserialize(deserializer)?;
+        let n = v.len();
+        v.try_into()
+            .map_err(|_| serde::de::Error::invalid_length(n, &"exactly 64 lanes"))
+    }
 }
 
 /// serde lacks built-in support for arrays longer than 32, so the 128-step
@@ -169,13 +200,6 @@ impl Track {
         }
         self.length = steps as u8;
         Ok(())
-    }
-
-    /// Removes every p-lock from every step of this track.
-    pub fn clear_all_locks(&mut self) {
-        for step in &mut self.steps {
-            step.clear_locks();
-        }
     }
 
     /// The track's cyclic timeline length in pulses (`length() × 24`).

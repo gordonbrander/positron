@@ -50,8 +50,8 @@ them, but no code is written for them now.
 | Tracks | Exactly 16 per sequencer |
 | Steps | 16 steps per page, 1–8 pages per track → track length 1–128 steps |
 | Track length | Independent per track (polymeter); default 16 |
-| Parameter lanes | 18 generic, unlabeled 0..1 values per track (defaults) and per fired event (resolved); the host decides what they mean (e.g. lanes 0–5 → FM operators, 6–9 → ADSR, 10–17 → macros) and scales 0..1 to real units |
-| Parameter locks | Per-step override of track parameters: velocity and any of the 18 lanes |
+| Parameter lanes | 64 generic, unlabeled 0..1 values per track (defaults) and per fired event (resolved); the host decides what they mean (e.g. lanes 0–7 → FM operators, 8–15 → envelopes, 16–23 → FX sends, …) and scales 0..1 to real units |
+| Parameter locks | Per-step override of track parameters (velocity and any lane), stored in a per-pattern **lock pool** of at most `MAX_LOCK_LANES = 80` distinct (track, destination) entries — the Elektron per-pattern lock budget. Locking an 81st distinct destination fails; clearing a destination's last locked step frees its slot |
 | Probability trigs | Per-step chance 0–100% that an enabled trig fires |
 | Conditional trigs | Elektron-style conditions: `FILL`, `!FILL`, `PRE`, `!PRE`, `NEI`, `!NEI`, `1ST`, `!1ST`, `A:B` ratios |
 | Fill mode | Host-controlled flag (`set_fill`) read by the `FILL`/`!FILL` conditions; momentary/latched/one-shot press behavior is host policy |
@@ -59,7 +59,7 @@ them, but no code is written for them now.
 | Retrigs | Per-step retrig train: rate, length, velocity ramp |
 | Swing | Per-pattern amount 50–80%, delays odd-indexed steps |
 | Pattern chaining | Multiple patterns; queued changes quantized to a per-pattern change length |
-| Output | Per step window: timed events `{track, velocity 0.0..=1.0, pulse offset}` |
+| Output | Per step window: timed events `{track, velocity 0.0..=1.0, pulse offset, resolved lanes, locked mask}` |
 
 ## Architecture
 
@@ -108,7 +108,8 @@ The host turns offsets into sample-accurate scheduling (or ignores them):
 
 ```rust
 pub const PULSES_PER_STEP: u8 = 24;
-pub const NUM_PARAM_LANES: usize = 18;
+pub const NUM_PARAM_LANES: usize = 64; // must stay <= 64: Event.locked is a u64
+pub const MAX_LOCK_LANES: usize = 80;  // per-pattern cap on distinct (track, destination) locks
 
 pub struct Event {
     pub track: u8,     // 0..16
@@ -117,6 +118,12 @@ pub struct Event {
     /// Resolved parameter-lane values: per lane, the step's lock if set,
     /// else the track default. See "Parameter lanes".
     pub lanes: [f32; NUM_PARAM_LANES], // each 0.0..=1.0
+    /// Bit `i` set ⇔ `lanes[i]` came from a lock rather than the track
+    /// default. Lanes only; velocity has its own flag (64 lanes use the
+    /// whole mask, and velocity is distinguished everywhere else too).
+    pub locked: u64,
+    /// True iff `velocity` came from a velocity lock.
+    pub velocity_locked: bool,
 }
 
 /// Fixed-capacity event list (capacity 160 — provably sufficient, see
@@ -168,6 +175,11 @@ pub struct Pattern {
     /// Pattern-change quantization in steps. None = master length
     /// (the longest track length in this pattern).
     pub change_length: Option<NonZeroU16>,
+    /// The parameter-lock pool: at most MAX_LOCK_LANES distinct
+    /// (track, destination) entries. Private — edited only through the
+    /// lock API below, which enforces the cap and the invariants.
+    /// Heap-allocated, touched only at edit time (never by `tick()`).
+    locks: Vec<LockLane>,
 }
 
 pub struct Track {
@@ -191,8 +203,6 @@ pub struct Params {
 pub struct Step {
     /// Is there a trig on this step at all?
     pub trig: bool,
-    /// Per-step parameter overrides ("p-locks"). None = use track default.
-    pub locks: ParamLocks,
     /// When the trig fires. Defaults to Condition::Always.
     pub condition: Condition,
     /// Micro-timing nudge in pulses, −23..=+23. Setter clamps. Default 0.
@@ -201,10 +211,44 @@ pub struct Step {
     pub retrig: Option<Retrig>,
 }
 
-pub struct ParamLocks {
-    pub velocity: Option<UnitValue>,
-    pub lanes: [Option<UnitValue>; NUM_PARAM_LANES],
+/// One lock-pool slot: every lock the pattern holds for a single
+/// (track, destination) pair, across all 128 steps. Crate-private; hosts
+/// see only the Pattern lock API. Invariants: at most one entry per
+/// distinct (track, dest); an entry whose `steps` mask is empty is
+/// removed (its slot is freed); value slots whose mask bit is clear are
+/// canonically `UnitValue::ZERO` (keeps derived `PartialEq` honest).
+struct LockLane {
+    track: u8,  // 0..NUM_TRACKS
+    dest: u8,   // 0..NUM_PARAM_LANES = lane index; 255 = velocity
+    steps: u128, // bit i set = step i holds a lock
+    values: [UnitValue; MAX_STEPS],
 }
+
+/// What a step would play against its track defaults — velocity, lanes,
+/// and which of them came from locks. Returned by value from
+/// `Pattern::resolve_step` (pure data; useful for UI display as well as
+/// playback).
+pub struct ResolvedStep {
+    pub velocity: f32,
+    pub lanes: [f32; NUM_PARAM_LANES],
+    pub locked: u64,          // bit i ⇔ lanes[i] from a lock
+    pub velocity_locked: bool,
+}
+
+// Pattern lock API (none of these panic; indices out of range yield
+// LockError::OutOfRange / None / no-op):
+//
+//   set_lane_lock(track, step, lane, value) -> Result<(), LockError>
+//   lane_lock(track, step, lane) -> Option<UnitValue>
+//   clear_lane_lock(track, step, lane)
+//   set_velocity_lock(track, step, value) -> Result<(), LockError>
+//   velocity_lock(track, step) -> Option<UnitValue>
+//   clear_velocity_lock(track, step)
+//   clear_step_locks(track, step)
+//   clear_track_locks(track)
+//   clear_all_locks()
+//   lock_count() -> usize              // occupied slots, 0..=MAX_LOCK_LANES
+//   resolve_step(track, step) -> Option<ResolvedStep>
 
 pub struct Retrig {
     /// Interval between hits (see rate table in "Timing semantics").
@@ -371,13 +415,26 @@ nearest representable rate is `R96`. Documented divergence.)
 
 **Parameter lanes.** Each fired event carries the track's `NUM_PARAM_LANES` lane
 values, resolved at examination time: per lane, the step's lock if set, else the
-track default. Lanes are **event-scoped** — values ride only on fired trigs, so a
-lane lock on a probability/conditional trig lands only when that trig actually
-fires, and non-fired steps emit nothing. The engine never interprets lane values;
-mapping lanes to synth parameters (and scaling 0..1 to Hz/seconds/ratios) is host
-territory, on the UI side of the shear line. Memory note: per-step lane locks cost
-a few hundred KB per pattern at 18 lanes — fine for desktop; a bitmask + packed
-representation is a possible future compression that would not change the API.
+track default — plus a `locked` mask (and `velocity_locked` flag) recording which
+values came from locks, so delta-style hosts can apply only what was locked while
+snapshot-style hosts apply everything. Lanes are **event-scoped** — values ride
+only on fired trigs, so a lane lock on a probability/conditional trig lands only
+when that trig actually fires, and non-fired steps emit nothing. The engine never
+interprets lane values; mapping lanes to synth parameters (and scaling 0..1 to
+Hz/seconds/ratios) is host territory, on the UI side of the shear line.
+
+**Lock pool.** Locks live in a per-pattern pool, as on the hardware: each
+distinct (track, destination) pair locked anywhere in the pattern occupies one
+pool slot, and the pool holds at most `MAX_LOCK_LANES = 80` slots. Locking more
+steps of an already-locked destination is free; locking an 81st distinct
+destination returns `LockError::PoolFull` (the host shows its "max locks
+reached" message); clearing a destination's last locked step frees its slot.
+Resolution at examination time copies the track defaults and overlays one pass
+over the pool (≤ 80 entries, allocation-free). Memory note: the pool is the
+representation — a pattern costs ~50 KB of step/track data plus ~536 B of heap
+per occupied slot (≤ ~43 KB fully locked), instead of the ~1 MB a dense
+per-step lane array would cost at 64 lanes. Pool allocation happens only in the
+edit API, never in `tick()`.
 
 **Output capacity.** Per track per window: at most 1 spilled event arrives from the
 previous window (only one of any two adjacent steps is odd-indexed, and only swing
@@ -434,13 +491,18 @@ t.set_length(64).unwrap();                 // 4 pages
 t.defaults.velocity = UnitValue::new(0.8);
 t.steps[0].trig = true;
 t.steps[4].trig = true;
-t.steps[4].locks.velocity = Some(UnitValue::new(0.3));   // p-lock
 t.steps[8].trig = true;
 t.steps[8].condition = Condition::Percent(UnitValue::new(0.5));
 t.steps[12].trig = true;
 t.steps[12].condition = Condition::Ratio { a: 1, b: 2 }; // every other loop
 t.steps[4].set_micro(-3);                                // 3 pulses early
 t.steps[8].retrig = Some(Retrig::new(RetrigRate::R32, RetrigLength::pulses(24), -0.5));
+
+// Parameter locks (pattern-level pool; can fail when the pool is full)
+let p = seq.current_pattern_mut();
+p.set_velocity_lock(0, 4, UnitValue::new(0.3)).unwrap();  // p-lock velocity
+p.set_lane_lock(0, 4, 7, UnitValue::new(0.9)).unwrap();   // p-lock lane 7
+assert_eq!(p.lock_count(), 2);                            // 2 of MAX_LOCK_LANES slots
 
 // Pattern-level feel & chaining
 seq.current_pattern_mut().set_swing(62);
@@ -468,6 +530,10 @@ for ev in out.iter() {
   `Step::set_micro` clamps to −23..=23, `Pattern::set_swing` clamps to 50..=80,
   `Retrig::set_vel_ramp` clamps to −1..=1, `queue_pattern` rejects out-of-range ids,
   `page`/`page_mut` return `Option` rather than panicking.
+- Lock-pool errors are explicit: `LockError::PoolFull` when locking an 81st
+  distinct (track, destination) pair, `LockError::OutOfRange` for invalid
+  track/step/lane indices. Lock getters return `None` and clears are no-ops for
+  invalid indices; no lock method panics.
 - No method panics on any sequence of public API calls (enforced by a fuzz/property
   test in the final slice).
 
@@ -534,6 +600,10 @@ page-oriented read/write helpers.*
       steps `0..length` cyclically
 
 ### Slice 3 — Parameter locks
+
+*Superseded by Slice 12: the per-step `ParamLocks` storage described here was
+replaced by a pattern-level lock pool (and the lane count widened 18 → 64).
+Resolution semantics are unchanged. Kept as history.*
 
 *Outcome: per-step overrides of velocity and all 18 parameter lanes — the Elektron
 p-lock mechanic.*
@@ -663,7 +733,8 @@ Behavior is unchanged after this slice (every offset is still 0); `Event` and
 - [x] Velocity ramp: linear from resolved trig velocity, hit `k` of `n` =
       `clamp(v0 + ramp * k/(n−1))`; `n = 1` plays at `v0`; `Infinite` ignores ramp
 - [x] Condition gates the whole train (one evaluation); velocity/lane p-locks set
-      the train's base values; lane values ride unchanged on every hit
+      the train's base values; lane values — and, since Slice 12, the locked
+      mask — ride unchanged on every hit
 - [x] Tests: hit spacing matches the table for every rate; a train spans window
       boundaries; finite train hit count = `length / interval + 1`; single-hit train
       (`length < interval`) plays at `v0`; `Infinite` runs until the next fired
@@ -719,3 +790,52 @@ reference host demonstrating the shear line.*
 - [x] Final API review: every public item documented, `#[non_exhaustive]` present on
       `Condition` (introduced in Slice 4), audit `pub` fields vs. accessors against
       the invariants
+
+### Slice 12 — Pattern-level lock pool (64 lanes)
+
+*Outcome: lock storage moves from a dense per-step array to an Elektron-faithful
+per-pattern pool of at most `MAX_LOCK_LANES = 80` distinct (track, destination)
+entries, and the lane space widens 18 → 64. Resolution semantics — lock if set,
+else track default; event-scoped; trains capture once — are unchanged; the dense
+representation from Slice 3 is removed. Patterns shrink from ~345 KB flat to
+~50 KB + ≤43 KB of edit-time heap, making bank-in-RAM and snapshot-per-edit undo
+cheap. Serde format break (pre-1.0): old files load, but their per-step locks are
+silently dropped.*
+
+- [ ] Constants: `NUM_PARAM_LANES = 64`, `MAX_LOCK_LANES = 80`, compile-time
+      assert `NUM_PARAM_LANES <= 64` (the `Event::locked` mask is a `u64`)
+- [ ] `src/locks.rs`: crate-private `LockLane { track, dest, steps: u128,
+      values: [UnitValue; MAX_STEPS] }` (dest 255 = velocity); public
+      `LockError { PoolFull, OutOfRange }` and `ResolvedStep { velocity, lanes,
+      locked, velocity_locked }`
+- [ ] Remove `ParamLocks`, `Step::locks`, `Step::clear_locks`, `Step::resolve`,
+      `Track::clear_all_locks`
+- [ ] Pattern lock API (see data-model sketch): set/get/clear for lane and
+      velocity locks, `clear_step_locks`/`clear_track_locks`/`clear_all_locks`,
+      `lock_count`, `resolve_step` — never panics, allocation only on slot
+      insert; clearing a slot's last step frees it (`Vec::remove`, preserving
+      insertion order); cleared value slots reset to `UnitValue::ZERO`
+- [ ] `Event` gains `locked: u64` + `velocity_locked: bool`; manual `Default`
+      (std has no `Default` for `[f32; 64]`); `ActiveTrain` captures both and
+      they ride unchanged on every train hit
+- [ ] `Sequencer::examine_step` resolves via `Pattern::resolve_step` (owned
+      return value — no borrows into the pool), still after condition
+      evaluation (PRNG draw order unchanged)
+- [ ] Serde: `Params.lanes` via a `lane_array` module (reject length ≠ 64);
+      pool serialized sparsely as `{track, dest, steps: [(step, value)...]}`
+      entries in ascending step order; deserialization clamps values and
+      rejects structural violations (bad track/dest/step, duplicate
+      destinations, duplicate steps, empty entries, pool > 80);
+      `serde(default)` so lock-less files load with an empty pool
+- [ ] Tests: migrate lock/condition/timing/retrig/fuzz/serde tests to the new
+      API; new coverage for pool exhaustion at the 81st destination, slot
+      freeing and reuse, one-slot-per-destination accounting, locked-mask
+      correctness (incl. retrig hits), out-of-range safety, serde rejection
+      cases, and a fuzz invariant `lock_count() <= MAX_LOCK_LANES`
+- [ ] Golden snapshot, two-phase: (A) migrate the builder, render only the
+      first 18 lanes, assert byte-identical output against the committed
+      snapshot — proves zero semantic drift; (B) extend the format with
+      `velocity_locked`, hex `locked` mask, and all 64 lanes, regenerate, and
+      review the diff
+- [ ] Example/README/docs updated; struct sizes re-measured for the README
+      memory table
