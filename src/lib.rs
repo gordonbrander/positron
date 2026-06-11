@@ -21,6 +21,7 @@
 //! ```
 
 mod condition;
+mod locks;
 mod output;
 mod pattern;
 mod retrig;
@@ -31,6 +32,7 @@ mod track;
 mod unit;
 
 pub use condition::{Condition, RatioError};
+pub use locks::{LockError, ResolvedStep};
 pub use output::{Event, MAX_EVENTS_PER_TICK, TickOutput};
 pub use pattern::{Pattern, PatternId};
 pub use retrig::{Retrig, RetrigLength, RetrigRate};
@@ -51,4 +53,13 @@ pub const MAX_STEPS: usize = STEPS_PER_PAGE * MAX_PAGES;
 /// `step_duration / 24` of host time.
 pub const PULSES_PER_STEP: u8 = 24;
 /// Number of generic parameter lanes carried per track and per fired event.
-pub const NUM_PARAM_LANES: usize = 18;
+/// Must stay ≤ 64: [`Event::locked`] records lock provenance in a `u64`.
+pub const NUM_PARAM_LANES: usize = 64;
+/// Per-pattern cap on distinct (track, destination) parameter locks — the
+/// Elektron lock budget. A destination is one lane of one track, or one
+/// track's velocity; locking more steps of an already-locked destination is
+/// free, but locking a new destination when the pool is full fails with
+/// [`LockError::PoolFull`].
+pub const MAX_LOCK_LANES: usize = 80;
+
+const _: () = assert!(NUM_PARAM_LANES <= 64, "Event::locked mask is a u64");

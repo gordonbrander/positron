@@ -65,6 +65,11 @@ struct ActiveTrain {
     vel_ramp: f32,
     /// The trig's resolved lanes, riding unchanged on every hit.
     lanes: [f32; NUM_PARAM_LANES],
+    /// Which lanes came from locks — captured once with the lanes and
+    /// riding unchanged on every hit, like them.
+    locked: u64,
+    /// Whether the trig's velocity came from a velocity lock.
+    velocity_locked: bool,
 }
 
 impl ActiveTrain {
@@ -112,7 +117,7 @@ struct TrackState {
 /// mutation is legal while playing, as on the hardware.
 #[derive(Clone, Debug)]
 pub struct Sequencer {
-    /// Heap storage (a pattern with full lane locks is a few hundred KB),
+    /// Heap storage (a pattern is a few tens of KB, plus its lock pool),
     /// allocated at construction/edit time only — never inside `tick()`.
     /// Always holds at least one pattern; `current` is always in range.
     patterns: Vec<Pattern>,
@@ -368,8 +373,15 @@ impl Sequencer {
             loop_count += 1;
         }
         if self.eval_condition(track, step.condition, loop_count) {
-            let (velocity, lanes) =
-                step.resolve(&self.patterns[self.current].tracks[track].defaults);
+            // Owned copy out of the pool (ResolvedStep is Copy) — the
+            // pattern borrow must end here, before the &mut self calls
+            // below.
+            let Some(resolved) =
+                self.patterns[self.current].resolve_step(track, usize::from(index))
+            else {
+                debug_assert!(false, "examine_step indices are validated by tick()");
+                return;
+            };
             let micro = i16::from(step.micro());
             // Un-pulled: micro in 0..=23. Pulled: 24 + micro in 1..=23.
             // Swing adds 0..=14 pulses to odd-indexed steps.
@@ -382,9 +394,11 @@ impl Sequencer {
             debug_assert!((0..24 + 14).contains(&offset));
             let event = Event {
                 track: track as u8,
-                velocity,
+                velocity: resolved.velocity,
                 offset: u8::try_from(offset % 24).unwrap_or(0),
-                lanes,
+                lanes: resolved.lanes,
+                locked: resolved.locked,
+                velocity_locked: resolved.velocity_locked,
             };
 
             // This fired trig replaces any active train: hits scheduled at
@@ -412,9 +426,11 @@ impl Sequencer {
                     emitted: 1, // the trig's own event is hit 0
                     total,
                     next_offset: offset + i16::try_from(interval).unwrap_or(i16::MAX),
-                    velocity,
+                    velocity: resolved.velocity,
                     vel_ramp: retrig.vel_ramp(),
-                    lanes,
+                    lanes: resolved.lanes,
+                    locked: resolved.locked,
+                    velocity_locked: resolved.velocity_locked,
                 });
             }
         }
@@ -432,6 +448,8 @@ impl Sequencer {
                 velocity: train.hit_velocity(train.emitted),
                 offset: u8::try_from(train.next_offset).unwrap_or(0),
                 lanes: train.lanes,
+                locked: train.locked,
+                velocity_locked: train.velocity_locked,
             });
             train.emitted += 1;
             train.next_offset += i16::try_from(train.interval).unwrap_or(i16::MAX);
@@ -453,6 +471,8 @@ impl Sequencer {
                 velocity: train.hit_velocity(train.emitted),
                 offset: u8::try_from(train.next_offset).unwrap_or(0),
                 lanes: train.lanes,
+                locked: train.locked,
+                velocity_locked: train.velocity_locked,
             });
             train.emitted += 1;
             train.next_offset += i16::try_from(train.interval).unwrap_or(i16::MAX);

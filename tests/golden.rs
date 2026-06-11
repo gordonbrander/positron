@@ -11,7 +11,7 @@ use std::num::NonZeroU16;
 
 /// A project exercising every feature: conditions, locks, polymeter,
 /// micro-timing, swing, retrigs, and a two-pattern chain.
-fn build() -> Sequencer {
+fn build() -> (Sequencer, plock::PatternId) {
     let mut seq = Sequencer::new(0x0E1E_C7E0);
     {
         let a = seq.current_pattern_mut();
@@ -22,7 +22,6 @@ fn build() -> Sequencer {
         for s in [0, 4, 8, 12] {
             t0.steps[s].trig = true;
         }
-        t0.steps[12].locks.velocity = Some(UnitValue::new(0.5));
 
         let t1 = &mut a.tracks[1]; // polymeter + probability
         t1.set_length(12).unwrap();
@@ -36,7 +35,6 @@ fn build() -> Sequencer {
         t2.steps[3].set_micro(9);
         t2.steps[8].trig = true;
         t2.steps[8].set_micro(-7);
-        t2.steps[8].locks.lanes[0] = Some(UnitValue::new(0.77));
 
         let t3 = &mut a.tracks[3]; // retrig with ramp, gated by ratio
         t3.steps[0].trig = true;
@@ -53,6 +51,9 @@ fn build() -> Sequencer {
         t5.steps[10].trig = true;
         t5.steps[10].condition = Condition::Fill;
     }
+    let a = seq.current_pattern_mut();
+    a.set_velocity_lock(0, 12, UnitValue::new(0.5)).unwrap();
+    a.set_lane_lock(2, 8, 0, UnitValue::new(0.77)).unwrap();
     let mut b = Pattern::default();
     b.tracks[6].set_length(5).unwrap();
     b.tracks[6].steps[0].trig = true;
@@ -61,14 +62,12 @@ fn build() -> Sequencer {
     let b = seq.add_pattern(b).unwrap();
 
     seq.play();
-    // Mid-run host actions are part of the scripted take.
-    seq.queue_pattern(b).unwrap();
-    seq
+    (seq, b)
 }
 
 #[test]
 fn golden_512_ticks() {
-    let mut seq = build();
+    let (mut seq, b) = build();
     let mut rendered = String::new();
     for tick in 0..512 {
         if tick == 40 {
@@ -77,11 +76,25 @@ fn golden_512_ticks() {
         if tick == 56 {
             seq.set_fill(false);
         }
+        if tick == 100 {
+            // Mid-run host action, part of the scripted take: queue the
+            // chain to pattern B (applies at the next change boundary,
+            // master step 128). Queued mid-run — not before the first tick
+            // — so pattern A actually plays; master step 0 is itself a
+            // boundary, and a pre-queued change would switch immediately.
+            seq.queue_pattern(b).unwrap();
+        }
         for ev in &seq.tick() {
+            // Row: tick,track,offset,velocity,velocity_locked(0/1),
+            // locked-mask(hex),lane0..lane63.
             write!(
                 rendered,
-                "{tick},{},{},{:.4}",
-                ev.track, ev.offset, ev.velocity
+                "{tick},{},{},{:.4},{},{:016x}",
+                ev.track,
+                ev.offset,
+                ev.velocity,
+                u8::from(ev.velocity_locked),
+                ev.locked
             )
             .unwrap();
             for lane in ev.lanes {

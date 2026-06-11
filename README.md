@@ -14,15 +14,18 @@ let mut seq = Sequencer::new(0xDEAD_BEEF); // seed for probability trigs
 let track = &mut seq.current_pattern_mut().tracks[0];
 track.steps[0].trig = true;
 track.steps[4].trig = true;
-track.steps[4].locks.velocity = Some(UnitValue::new(0.3)); // p-lock
 track.steps[8].trig = true;
 track.steps[8].condition = Condition::Percent(UnitValue::new(0.5));
+seq.current_pattern_mut()
+    .set_velocity_lock(0, 4, UnitValue::new(0.3)) // p-lock; Err when the
+    .unwrap();                                    // pool is full
 
 seq.play();
 let out = seq.tick(); // call once per sixteenth note
 for ev in &out {
     // ev.track fired with ev.velocity (0..=1), ev.offset pulses into this
-    // step window, carrying 18 resolved lane values in ev.lanes.
+    // step window, carrying 64 resolved lane values in ev.lanes (with
+    // ev.locked marking which came from locks).
 }
 ```
 
@@ -36,8 +39,8 @@ table and tempo handling.
 |---|---|
 | Tracks | 16, each 1–128 steps (16 steps/page × up to 8 pages) |
 | Polymeter | Per-track lengths; tracks wrap and count loops independently |
-| Parameter lanes | 18 generic, unlabeled `0..1` values per event; host defines meaning |
-| Parameter locks | Per-step overrides of velocity and any lane |
+| Parameter lanes | 64 generic, unlabeled `0..1` values per event; host defines meaning |
+| Parameter locks | Per-step overrides of velocity and any lane, in a per-pattern pool of ≤ 80 distinct (track, destination) lock lanes — the Elektron lock budget |
 | Probability trigs | `Condition::Percent(p)`, seeded PRNG, bit-identical replays |
 | Conditional trigs | `FILL`/`!FILL`, `PRE`/`!PRE`, `NEI`/`!NEI`, `1ST`/`!1ST`, `A:B` ratios |
 | Micro-timing | Per-step nudge, −23..=+23 pulses (24 pulses = 1 step) |
@@ -63,6 +66,7 @@ table and tempo handling.
 ├─────────────────────────────────────────────┤
 │ Patterns  (pure data: what to play)         │
 │   N × Pattern { swing, change_length,       │
+│     lock pool (≤ 80 lock lanes),            │
 │     16 × Track { length, defaults,          │
 │                  steps: [Step; 128] } }     │
 └─────────────────────────────────────────────┘
@@ -77,23 +81,36 @@ how encoders map, momentary-vs-latched fill buttons) belongs to the host.
 All pattern mutation is legal while the transport runs, as on the hardware;
 edits take effect the next time the affected step is evaluated.
 
-### Parameter lanes
+### Parameter lanes & the lock pool
 
 The engine never knows what a lane means. `Params` carries a distinguished
-`velocity` plus `lanes: [UnitValue; 18]` as track defaults; each step can lock
+`velocity` plus `lanes: [UnitValue; 64]` as track defaults; each step can lock
 any of them; each fired event carries the resolved values (`lock if set, else
-track default`). The host owns the mapping table and unit scaling, e.g.:
+track default`) plus provenance — `Event::locked` is a bitmask of which lanes
+came from locks, and `Event::velocity_locked` covers velocity. The host owns
+the mapping table and unit scaling, e.g.:
 
 ```text
 lanes 0–5   → FM operator levels
 lanes 6–9   → ADSR attack/decay/sustain/release
 lanes 10–17 → performance macros
+lanes 18–63 → yours to assign
 ```
 
 Lanes are **event-scoped**: values ride only on fired trigs, so a lane lock
 behind a 50% probability trig lands only when that trig actually fires.
 Velocity is not lane 0 because it has engine-side semantics: it gates output
 and drives the retrig velocity ramp.
+
+Locks are stored Elektron-style, in a **per-pattern pool**: each distinct
+(track, destination) pair locked anywhere in the pattern occupies one of
+`MAX_LOCK_LANES = 80` slots (velocity counts as a destination). Locking more
+steps of an already-locked destination is free; locking an 81st distinct
+destination returns `LockError::PoolFull` — show your "max locks reached"
+message; clearing a destination's last locked step frees its slot. Edits go
+through `Pattern`'s lock API (`set_lane_lock`, `set_velocity_lock`,
+`lane_lock`, `clear_*`, `lock_count`, `resolve_step`); allocation happens
+only there, never in `tick()`.
 
 ## Time model
 
@@ -155,15 +172,20 @@ let page: &[Step] = t.page(1).unwrap();       // Option, never panics
 t.defaults.velocity = UnitValue::new(0.8);
 t.steps[0].trig = true;
 t.steps[0].set_micro(-11);                    // clamps to -23..=23
-t.steps[0].locks.lanes[4] = Some(UnitValue::new(0.9));
 t.steps[0].retrig = Some(Retrig::new(RetrigRate::R32, RetrigLength::pulses(24), -0.5));
 t.steps[0].condition = Condition::ratio(3, 8)?; // validated constructor
+p.set_lane_lock(3, 0, 4, UnitValue::new(0.9))?; // p-lock: track 3, step 0, lane 4
+p.lane_lock(3, 0, 4);                           // -> Some(UnitValue)
+p.clear_lane_lock(3, 0, 4);                     // frees the pool slot
 ```
 
 Invariants are guarded at the API boundary: `UnitValue` clamps (NaN → 0),
 `set_micro`/`set_swing`/`set_vel_ramp` clamp, `set_length`/`set_page_count`/
-`queue_pattern` return `Result`, page accessors return `Option`. **No public
-API sequence panics** — enforced by a property fuzzer (see Testing).
+`queue_pattern` return `Result`, page accessors return `Option`, and lock
+setters return `Result` (`LockError::PoolFull` at the 81st distinct
+destination, `LockError::OutOfRange` for bad indices — getters and clears
+just return `None`/no-op). **No public API sequence panics** — enforced by a
+property fuzzer (see Testing).
 
 ### Trig conditions
 
@@ -243,41 +265,33 @@ feature pins the semantics; CI-style gates fail on any drift.
 Fixed-size storage is a design goal (`tick()` never allocates or locks), and
 it has consequences you should know about:
 
-| Type | Size (approx.) | Where it lives |
+| Type | Size (measured, 64-bit) | Where it lives |
 |---|---|---|
-| `Step` | ~156 B | 19 optional locks (`Option<UnitValue>` is 8 B — no niche) |
-| `Track` | ~20 KB | 128 steps + defaults |
-| `Pattern` | **~320 KB** | 16 tracks |
-| `Sequencer` | ~few hundred B + heap | patterns are heap-allocated (`Vec<Pattern>`) |
-| `TickOutput` | ~12.8 KB | returned **by value** from `tick()`; capacity 160 events |
+| `Step` | 20 B | trig, condition, micro, retrig — locks live in the pool |
+| `Track` | ~2.8 KB | 128 steps + 64-lane defaults |
+| `Pattern` | **~44 KB** + lock pool | 16 tracks inline; the pool adds ~544 B of heap per occupied slot (≤ ~43 KB at the 80-slot cap) |
+| `Sequencer` | ~22 KB + heap | patterns are heap-allocated (`Vec<Pattern>`); the inline part is pending buffers and per-track state |
+| `Event` | 272 B | velocity + 64 lanes + lock-provenance mask |
+| `TickOutput` | ~42.5 KB | returned **by value** from `tick()`; capacity 160 events |
 
 Practical guidance:
 
+- **Patterns are cheap to keep around and snapshot.** At ~44 KB + a typically
+  small pool, holding a 128-pattern bank in RAM costs a few MB, and
+  clone-per-edit undo for performance modes is a non-event. (The dense
+  per-step representation this replaced was ~345 KB per pattern at 18 lanes,
+  and over 1 MB at 64.)
 - **`Sequencer` keeps patterns on the heap**, allocated at construction and
-  edit time only — never inside `tick()`. The struct itself is small and
-  cheap to move.
-- **Avoid placing a bare `Pattern` on a small thread's stack in debug
-  builds.** Unoptimized builds don't elide moves, so chained construction
-  (`Pattern::default()` → struct literal → return) can briefly stack several
-  ~320 KB copies. This crate sets `[profile.dev] opt-level = 1` (debug
-  assertions stay on) specifically because the un-elided copies overflowed
-  the default 2 MiB test-thread stack; dependents compile this crate with
-  their own profile, so if you build at `opt-level = 0` and construct
-  patterns on worker threads, give those threads headroom
-  (`std::thread::Builder::stack_size`) or build patterns on the main thread
-  (8 MiB by default).
-- **serde deserialization of a full `Pattern` holds a few ~320 KB
-  temporaries at once** (the in-progress array in the visitor, the returned
-  value, your binding). On the main thread that's fine; on a default 2 MiB
-  spawned thread in a debug build it can overflow. The crate's own round-trip
-  tests run on an explicitly sized 8 MiB thread for exactly this reason —
-  do the same if you deserialize patterns off-thread.
-- **`TickOutput` is a ~12.8 KB by-value return.** That's a trivial stack copy
-  per tick, but if your audio callback's stack budget is tight, hold it in a
+  edit time only — never inside `tick()`. Lock edits may allocate (a new pool
+  slot); `tick()`, including lock resolution, does not.
+- **`TickOutput` is a ~42.5 KB by-value return.** Still a single memcpy per
+  tick, but if your audio callback's stack budget is tight, hold it in a
   pre-allocated slot rather than nesting it deep in a call chain.
-- The per-step lock representation trades memory for simplicity (a bitmask +
-  packed-values encoding could shrink it ~4× without changing the API);
-  that's noted in the spec as a future compression.
+- The old warnings about ~320 KB `Pattern` temporaries overflowing 2 MiB
+  thread stacks in debug builds no longer apply at the new sizes. The crate
+  keeps `[profile.dev] opt-level = 1` anyway (un-elided `TickOutput` copies
+  are still ~42 KB each, and the engine is meant to be run, not stepped
+  through).
 
 ## serde support
 
@@ -288,11 +302,20 @@ plock = { version = "0.1", features = ["serde"] }
 `Pattern` and everything inside it implement `Serialize`/`Deserialize`;
 `Sequencer` runtime state deliberately does not. Deserialization re-validates
 every invariant, in the same spirit as the live API: clampable scalars
-re-clamp (velocities, lanes, micro, swing, `vel_ramp` — hand-edited files are
-tolerated), while structural breakage errors out (track length 0 or > 128,
-step arrays that aren't exactly 128 long). The 128-step array round-trips as
-a plain sequence via a hand-rolled `serde(with)` module, since serde lacks
-built-in impls for arrays longer than 32.
+re-clamp (velocities, lanes, lock values, micro, swing, `vel_ramp` —
+hand-edited files are tolerated), while structural breakage errors out (track
+length 0 or > 128, step arrays that aren't exactly 128 long, lane arrays that
+aren't exactly 64 long, and any malformed lock pool: bad track/destination/
+step indices, duplicate destinations or steps, empty entries, more than 80
+slots). The long arrays round-trip as plain sequences via hand-rolled
+`serde(with)` modules, since serde lacks built-in impls for arrays longer
+than 32.
+
+The lock pool serializes **sparsely** — one `{track, dest, steps: [[step,
+value], …]}` entry per occupied slot, locked steps only — so files stay small
+no matter the lane count. A pattern with no `locks` field (any pre-pool file)
+loads with an empty pool: old files open fine, but their per-step locks are
+silently dropped (pre-1.0 format break, this one time).
 
 ## Testing
 
@@ -304,12 +327,14 @@ cargo fmt --check
 cargo run --example cli_host     # hear-it-in-your-head smoke test
 ```
 
-88 tests across eleven integration suites (plus in-module unit tests and a
+98 tests across twelve integration suites (plus in-module unit tests and a
 doctest):
 
 - `tests/transport.rs`, `polymeter.rs`, `locks.rs` — core engine behavior,
   including a proptest property that any track length cycles exactly
-  `0..length`.
+  `0..length`, plus the lock-pool rules: exhaustion at the 80th distinct
+  destination, slot freeing and reuse, one-slot-per-destination accounting,
+  locked-mask provenance, and out-of-range safety.
 - `tests/conditions.rs`, `determinism.rs` — every condition rule (incl. NEI
   transparency, grid-order PRE) and the determinism contract (same seed ⇒
   identical 1000-tick output; `Always` steps consume no draws).
@@ -318,8 +343,9 @@ doctest):
   and the worst-case capacity bound (16 tracks × `R96`).
 - `tests/chaining.rs` — boundary exactness, chains, queue semantics.
 - `tests/fuzz.rs` — proptest fuzzer applying arbitrary public-API call
-  sequences (including invalid `Ratio` literals and out-of-range ids):
-  asserts no panics and all outputs within `0.0..=1.0`.
+  sequences (including invalid `Ratio` literals, out-of-range ids, and lock
+  set/clear churn against the pool cap): asserts no panics, all outputs
+  within `0.0..=1.0`, and `lock_count() <= MAX_LOCK_LANES` throughout.
 - `tests/golden.rs` — the 512-tick snapshot. After an *intentional* semantic
   change, regenerate with `UPDATE_GOLDEN=1 cargo test --test golden` and
   review the diff like source code.
@@ -330,11 +356,12 @@ doctest):
 src/
   lib.rs        crate docs, constants, re-exports
   unit.rs       UnitValue (clamped 0..=1 newtype)
-  step.rs       Step, ParamLocks
+  step.rs       Step (trig, condition, micro, retrig)
+  locks.rs      LockLane (pool slot), LockError, ResolvedStep
   condition.rs  Condition + validated ratio()
   retrig.rs     Retrig, RetrigRate, RetrigLength
   track.rs      Track, Params, pages, pulse helpers
-  pattern.rs    Pattern, PatternId, swing, change_length
+  pattern.rs    Pattern, PatternId, swing, change_length, lock pool API
   rng.rs        private PCG32 (~30 lines)
   output.rs     Event, TickOutput (fixed-capacity, stable sort)
   sequencer.rs  Sequencer: transport, examination, trains, chaining

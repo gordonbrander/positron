@@ -252,7 +252,9 @@ fn probability_gates_locks_too() {
     track.set_length(1).unwrap();
     track.steps[0].trig = true;
     track.steps[0].condition = Condition::Percent(UnitValue::new(0.5));
-    track.steps[0].locks.lanes[4] = Some(UnitValue::new(0.9));
+    seq.current_pattern_mut()
+        .set_lane_lock(0, 0, 4, UnitValue::new(0.9))
+        .unwrap();
 
     seq.play();
     let mut fired_count = 0;

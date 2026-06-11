@@ -6,9 +6,9 @@ rust-version = "1.85"
 description = "Headless Elektron-like step sequencer"
 license = "MIT OR Apache-2.0"
 
-# Basic optimization in dev so large fixed-size pattern values (~320 KB) get
-# their copies elided during construction; unoptimized builds can otherwise
-# overflow 2 MiB test-thread stacks. Debug assertions remain enabled.
+# Basic optimization in dev so large by-value moves (TickOutput is ~42 KB,
+# Pattern ~44 KB) get elided instead of stacking up in unoptimized builds.
+# Debug assertions remain enabled.
 [profile.dev]
 opt-level = 1
 
@@ -17,9 +17,8 @@ serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 # Serialize/Deserialize for Pattern and everything inside it (never the
-# Sequencer's runtime state). Deserialization re-validates every invariant.
-# Note: deserializing a full Pattern holds a few ~320 KB stack temporaries;
-# do it on a thread with headroom (the main thread is fine).
+# Sequencer's runtime state). Deserialization re-validates every invariant;
+# the lock pool serializes sparsely and is structurally validated on load.
 serde = ["dep:serde"]
 
 [dev-dependencies]
@@ -39,6 +38,10 @@ module_name_repetitions = "allow"
 # The engine is deterministic and passes f32 values through unchanged;
 # tests intentionally assert exact equality.
 float_cmp = "allow"
-# Fixed-size pattern storage is a design goal (no allocation in tick());
-# a Track with per-step lane locks is ~20 KB, documented in spec.md.
+# Fixed-size storage is a design goal (no allocation in tick()); the
+# TickOutput event array (~42 KB) and a Track's 128-step array are the big
+# ones, documented in spec.md and README.
 large_stack_arrays = "allow"
+# Event (272 B at 64 lanes) is plain-old-data deliberately copied by value
+# into fixed-capacity buffers; one memcpy is the point, not an accident.
+large_types_passed_by_value = "allow"

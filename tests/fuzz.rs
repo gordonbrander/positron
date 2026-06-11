@@ -42,6 +42,18 @@ enum Op {
         lane: u8,
         v: f32,
     },
+    ClearVelLock {
+        track: u8,
+        step: u8,
+    },
+    ClearLaneLock {
+        track: u8,
+        step: u8,
+        lane: u8,
+    },
+    ClearTrackLocks {
+        track: u8,
+    },
     SetCondition {
         track: u8,
         step: u8,
@@ -96,6 +108,13 @@ fn op_strategy() -> impl Strategy<Value = Op> {
                 v
             }
         ),
+        (any::<u8>(), any::<u8>()).prop_map(|(track, step)| Op::ClearVelLock { track, step }),
+        (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(track, step, lane)| Op::ClearLaneLock {
+            track,
+            step,
+            lane
+        }),
+        any::<u8>().prop_map(|track| Op::ClearTrackLocks { track }),
         (
             any::<u8>(),
             any::<u8>(),
@@ -194,14 +213,36 @@ proptest! {
                     t.steps[usize::from(step) % 128].set_micro(micro);
                 }
                 Op::SetVelLock { track, step, v } => {
-                    let t = &mut seq.current_pattern_mut().tracks[usize::from(track) % 16];
-                    t.steps[usize::from(step) % 128].locks.velocity = Some(UnitValue::new(v));
+                    // PoolFull is an expected, legal outcome — exactly what
+                    // the fuzzer should exercise at the cap.
+                    let _ = seq.current_pattern_mut().set_velocity_lock(
+                        usize::from(track) % 16,
+                        usize::from(step) % 128,
+                        UnitValue::new(v),
+                    );
                 }
                 Op::SetLaneLock { track, step, lane, v } => {
-                    let t = &mut seq.current_pattern_mut().tracks[usize::from(track) % 16];
-                    t.steps[usize::from(step) % 128].locks.lanes
-                        [usize::from(lane) % plock::NUM_PARAM_LANES] =
-                        Some(UnitValue::new(v));
+                    let _ = seq.current_pattern_mut().set_lane_lock(
+                        usize::from(track) % 16,
+                        usize::from(step) % 128,
+                        usize::from(lane) % plock::NUM_PARAM_LANES,
+                        UnitValue::new(v),
+                    );
+                }
+                Op::ClearVelLock { track, step } => {
+                    seq.current_pattern_mut()
+                        .clear_velocity_lock(usize::from(track) % 16, usize::from(step) % 128);
+                }
+                Op::ClearLaneLock { track, step, lane } => {
+                    seq.current_pattern_mut().clear_lane_lock(
+                        usize::from(track) % 16,
+                        usize::from(step) % 128,
+                        usize::from(lane) % plock::NUM_PARAM_LANES,
+                    );
+                }
+                Op::ClearTrackLocks { track } => {
+                    seq.current_pattern_mut()
+                        .clear_track_locks(usize::from(track) % 16);
                 }
                 Op::SetCondition { track, step, pick, a, b, p } => {
                     let t = &mut seq.current_pattern_mut().tracks[usize::from(track) % 16];
@@ -224,6 +265,7 @@ proptest! {
                 }
                 Op::ClearQueue => seq.clear_queue(),
             }
+            prop_assert!(seq.current_pattern().lock_count() <= plock::MAX_LOCK_LANES);
         }
     }
 }

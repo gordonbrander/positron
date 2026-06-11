@@ -157,8 +157,10 @@ fn lanes_ride_unchanged_on_every_hit() {
     track.set_length(128).unwrap();
     track.defaults.lanes[2] = UnitValue::new(0.3);
     track.steps[0].trig = true;
-    track.steps[0].locks.lanes[7] = Some(UnitValue::new(0.9));
     track.steps[0].retrig = Some(Retrig::new(RetrigRate::R96, RetrigLength::pulses(20), -0.5));
+    seq.current_pattern_mut()
+        .set_lane_lock(0, 0, 7, UnitValue::new(0.9))
+        .unwrap();
 
     seq.play();
     let out = seq.tick();
@@ -166,6 +168,10 @@ fn lanes_ride_unchanged_on_every_hit() {
     for ev in &out {
         assert_eq!(ev.lanes[2], 0.3);
         assert_eq!(ev.lanes[7], 0.9);
+        // The locked mask is captured once with the lanes and rides on
+        // every hit of the train.
+        assert_eq!(ev.locked, 1 << 7);
+        assert!(!ev.velocity_locked);
     }
 }
 
